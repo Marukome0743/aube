@@ -303,6 +303,39 @@ EOF
 	[ ! -e node_modules/.bin/linked-tool ]
 }
 
+@test "aube install fails on a malformed workspace package that another importer links, whichever importer comes first" {
+	# A `link:` reader of a bad manifest only warns, but a `workspace:*`
+	# reader of the same directory must still fail the install with the
+	# manifest's error code, in either importer order.
+	for link_importer in a b; do
+		rm -rf ws
+		mkdir -p ws/packages/pkg ws/packages/a ws/packages/b
+		cat >ws/package.json <<'EOF'
+{"name":"root","version":"0.0.0","private":true}
+EOF
+		cat >ws/pnpm-workspace.yaml <<'EOF'
+packages:
+  - "packages/*"
+EOF
+		echo '{not json' >ws/packages/pkg/package.json
+		for importer in a b; do
+			if [ "$importer" = "$link_importer" ]; then
+				spec='link:../pkg'
+			else
+				spec='workspace:*'
+			fi
+			echo "{\"name\":\"$importer\",\"version\":\"0.0.0\",\"dependencies\":{\"pkg\":\"$spec\"}}" >"ws/packages/$importer/package.json"
+		done
+
+		cd ws
+		run aube install
+		cd ..
+		assert_failure 70
+		assert_output --partial "ERR_AUBE_MANIFEST_PARSE"
+		assert_output --partial "pkg/package.json"
+	done
+}
+
 @test "a link: dep's bins win over a same-named workspace package" {
 	mkdir -p outside/tool packages/tool
 	cat >outside/tool/package.json <<'EOF'

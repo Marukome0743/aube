@@ -5,13 +5,24 @@ use std::path::{Path, PathBuf};
 
 pub(crate) type PkgJsonCache = BTreeMap<String, Option<serde_json::Value>>;
 
-/// Per-install cache of workspace-package `package.json` reads. Keyed
-/// by the workspace dir on disk so a popular tooling package consumed
-/// by many importers gets read and parsed once, not once per consumer.
-/// Manifests of directories bins are read from outside the virtual store,
-/// keyed by directory: the parsed manifest, `None` when there is none, or
-/// why it couldn't be read or parsed.
-pub(crate) type WsPkgJsonCache = BTreeMap<PathBuf, Result<Option<serde_json::Value>, String>>;
+/// Per-install cache of the `package.json` in each directory bins are read
+/// from outside the virtual store (workspace packages and `link:` targets),
+/// so a package many importers depend on is read and parsed once. Holds
+/// the parsed manifest, `None` when there is none, or why it couldn't be
+/// used.
+pub(crate) type DirPkgJsonCache =
+    BTreeMap<PathBuf, Result<Option<serde_json::Value>, ManifestFailure>>;
+
+/// Why a directory's `package.json` couldn't be used.
+#[derive(Debug)]
+pub(crate) struct ManifestFailure {
+    /// Shown in a `WarnAndSkip` warning.
+    message: String,
+    /// The typed parse error, kept so a `Fail` reader reports it with its
+    /// code (`ERR_AUBE_MANIFEST_PARSE`). `None` for a read failure, and
+    /// after a `Fail` reader has taken it.
+    parse_error: Option<aube_manifest::Error>,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ManagedBinEntry {
@@ -298,7 +309,7 @@ pub(super) fn link_bins(
     shim_opts: aube_linker::BinShimOptions,
     cache: &mut PkgJsonCache,
     ws_dirs: Option<&BTreeMap<String, PathBuf>>,
-    ws_cache: &mut WsPkgJsonCache,
+    ws_cache: &mut DirPkgJsonCache,
     managed: &mut ManagedBinLinks,
     preserved: Option<&PreservedBinLinks>,
 ) -> miette::Result<()> {
@@ -385,7 +396,7 @@ enum ManifestErrors {
 /// A missing `package.json` is not an error: the dep has no bins, and,
 /// like pnpm, install says nothing about it.
 fn read_bin_manifest(
-    cache: &mut WsPkgJsonCache,
+    cache: &mut DirPkgJsonCache,
     dir: &Path,
     name: &str,
     on_error: ManifestErrors,
@@ -395,24 +406,38 @@ fn read_bin_manifest(
         match std::fs::read_to_string(&pkg_json_path) {
             Ok(content) => aube_manifest::parse_json(&pkg_json_path, content)
                 .map(Some)
-                // The parse error already names the file.
-                .map_err(|e| e.to_string()),
+                .map_err(|e| ManifestFailure {
+                    // The parse error already names the file.
+                    message: e.to_string(),
+                    parse_error: Some(e),
+                }),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(format!("failed to read {}: {e}", pkg_json_path.display())),
+            Err(e) => Err(ManifestFailure {
+                message: format!("failed to read {}: {e}", pkg_json_path.display()),
+                parse_error: None,
+            }),
         }
     });
     match (loaded, on_error) {
         (Ok(pkg_json), _) => Ok(pkg_json.clone()),
-        (Err(problem), ManifestErrors::WarnAndSkip) => {
+        (Err(failure), ManifestErrors::WarnAndSkip) => {
             tracing::warn!(
                 code = aube_codes::warnings::WARN_AUBE_LINK_DEP_MANIFEST_UNREADABLE,
-                "skipping bins of link: dep {name}: {problem}"
+                "skipping bins of link: dep {name}: {}",
+                failure.message
             );
             Ok(None)
         }
-        (Err(problem), ManifestErrors::Fail) => Err(miette!(
-            "failed to load package.json for workspace dep {name}: {problem}"
-        )),
+        (Err(failure), ManifestErrors::Fail) => {
+            match failure.parse_error.take() {
+                Some(e) => Err(miette::Report::new(e)
+                    .wrap_err(format!("failed to parse package.json for {name}"))),
+                None => Err(miette!(
+                    "failed to load package.json for {name}: {}",
+                    failure.message
+                )),
+            }
+        }
     }
 }
 
@@ -869,7 +894,7 @@ pub(crate) fn link_all_bins(input: LinkAllBinsInput<'_>) -> miette::Result<Manag
     };
 
     let mut pkg_json_cache = PkgJsonCache::new();
-    let mut ws_pkg_json_cache = WsPkgJsonCache::new();
+    let mut ws_pkg_json_cache = DirPkgJsonCache::new();
     let mut managed = if capture_managed {
         ManagedBinLinks::capturing()
     } else {
@@ -2432,7 +2457,7 @@ mod tests {
             opts,
             &mut PkgJsonCache::new(),
             None,
-            &mut WsPkgJsonCache::new(),
+            &mut DirPkgJsonCache::new(),
             &mut managed,
             None,
         )
@@ -2460,7 +2485,7 @@ mod tests {
             opts,
             &mut PkgJsonCache::new(),
             None,
-            &mut WsPkgJsonCache::new(),
+            &mut DirPkgJsonCache::new(),
             &mut relinked,
             Some(&preserved),
         )
@@ -2525,7 +2550,7 @@ mod tests {
             aube_linker::BinShimOptions::default(),
             &mut PkgJsonCache::new(),
             None,
-            &mut WsPkgJsonCache::new(),
+            &mut DirPkgJsonCache::new(),
             &mut ManagedBinLinks::default(),
             None,
         )
@@ -2687,11 +2712,16 @@ mod tests {
         // so a later `Fail` reader still fails after a `WarnAndSkip` one.
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("package.json"), "{not json").unwrap();
-        let mut cache = WsPkgJsonCache::new();
+        let mut cache = DirPkgJsonCache::new();
         let skipped = read_bin_manifest(&mut cache, dir.path(), "pkg", ManifestErrors::WarnAndSkip);
         assert!(matches!(skipped, Ok(None)));
-        let failed = read_bin_manifest(&mut cache, dir.path(), "pkg", ManifestErrors::Fail);
-        assert!(failed.is_err());
+        let failed = read_bin_manifest(&mut cache, dir.path(), "pkg", ManifestErrors::Fail)
+            .expect_err("a Fail reader fails on a cached parse error");
+        // The typed parse error survives the cache, so the exit code does.
+        assert_eq!(
+            failed.code().map(|code| code.to_string()).as_deref(),
+            Some(aube_codes::errors::ERR_AUBE_MANIFEST_PARSE)
+        );
         // A missing manifest is "no bins" under either policy.
         let empty = tempfile::tempdir().unwrap();
         assert!(matches!(
