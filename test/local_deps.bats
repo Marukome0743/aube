@@ -196,6 +196,113 @@ EOF
 	[ -L node_modules/broken ]
 }
 
+@test "aube install links the bins of a link: dep with node-linker=hoisted" {
+	mkdir -p linked-tool app
+	cat >linked-tool/package.json <<'EOF'
+{"name":"linked-tool","version":"1.0.0","bin":{"linked-tool":"cli.js"}}
+EOF
+	printf '#!/usr/bin/env node\nconsole.log("linked-tool ran");\n' >linked-tool/cli.js
+	chmod +x linked-tool/cli.js
+	cd app
+	cat >package.json <<'EOF'
+{"name":"app","version":"0.0.0","dependencies":{"linked-tool":"link:../linked-tool"}}
+EOF
+	echo 'node-linker=hoisted' >.npmrc
+
+	run aube install
+	assert_success
+	[ -e node_modules/.bin/linked-tool ]
+	run aube exec linked-tool
+	assert_success
+	assert_output "linked-tool ran"
+}
+
+@test "aube rebuild relinks the bins of a link: dep" {
+	mkdir -p linked-tool app
+	cat >linked-tool/package.json <<'EOF'
+{"name":"linked-tool","version":"1.0.0","bin":{"linked-tool":"cli.js"}}
+EOF
+	printf '#!/usr/bin/env node\nconsole.log("linked-tool ran");\n' >linked-tool/cli.js
+	chmod +x linked-tool/cli.js
+	cd app
+	cat >package.json <<'EOF'
+{"name":"app","version":"0.0.0","dependencies":{"linked-tool":"link:../linked-tool"}}
+EOF
+
+	run aube install
+	assert_success
+	rm node_modules/.bin/linked-tool*
+
+	run aube rebuild
+	assert_success
+	[ -e node_modules/.bin/linked-tool ]
+	run aube exec linked-tool
+	assert_success
+	assert_output "linked-tool ran"
+}
+
+@test "aube install keeps a link: dep's bins through the relink after a dependency build" {
+	# A dependency's lifecycle script makes install relink every bin.
+	mkdir -p linked-tool app
+	cat >linked-tool/package.json <<'EOF'
+{"name":"linked-tool","version":"1.0.0","bin":{"linked-tool":"cli.js"}}
+EOF
+	printf '#!/usr/bin/env node\nconsole.log("linked-tool ran");\n' >linked-tool/cli.js
+	chmod +x linked-tool/cli.js
+	cd app
+	cat >package.json <<'EOF'
+{"name":"app","version":"0.0.0","dependencies":{"linked-tool":"link:../linked-tool","aube-test-builds-marker":"^1.0.0"},"pnpm":{"allowBuilds":{"aube-test-builds-marker":true}}}
+EOF
+
+	run aube install
+	assert_success
+	assert_file_exists aube-builds-marker.txt
+	run aube exec linked-tool
+	assert_success
+	assert_output "linked-tool ran"
+}
+
+@test "aube install links no bins and warns nothing for a link: dep without a package.json" {
+	# Like pnpm, a link: target with no manifest simply has no bins.
+	mkdir -p bare app
+	echo 'console.log(1)' >bare/index.js
+	cd app
+	cat >package.json <<'EOF'
+{"name":"app","version":"0.0.0","dependencies":{"bare":"link:../bare"}}
+EOF
+
+	run aube install
+	assert_success
+	refute_output --partial "WARN_AUBE_LINK_DEP_MANIFEST_UNREADABLE"
+	[ -L node_modules/bare ]
+	[ ! -e node_modules/.bin/bare ]
+}
+
+@test "aube install follows a link: target's changed bin" {
+	mkdir -p linked-tool app
+	cat >linked-tool/package.json <<'EOF'
+{"name":"linked-tool","version":"1.0.0","bin":{"linked-tool":"cli.js"}}
+EOF
+	printf '#!/usr/bin/env node\nconsole.log("linked-tool ran");\n' >linked-tool/cli.js
+	chmod +x linked-tool/cli.js
+	cd app
+	cat >package.json <<'EOF'
+{"name":"app","version":"0.0.0","dependencies":{"linked-tool":"link:../linked-tool"}}
+EOF
+
+	run aube install
+	assert_success
+	[ -e node_modules/.bin/linked-tool ]
+
+	cat >../linked-tool/package.json <<'EOF'
+{"name":"linked-tool","version":"1.0.0","bin":{"renamed-tool":"cli.js"}}
+EOF
+	run aube install
+	assert_success
+	[ -e node_modules/.bin/renamed-tool ]
+	[ ! -e node_modules/.bin/linked-tool ]
+}
+
 @test "a link: dep's bins win over a same-named workspace package" {
 	mkdir -p outside/tool packages/tool
 	cat >outside/tool/package.json <<'EOF'

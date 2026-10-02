@@ -8,7 +8,10 @@ pub(crate) type PkgJsonCache = BTreeMap<String, Option<serde_json::Value>>;
 /// Per-install cache of workspace-package `package.json` reads. Keyed
 /// by the workspace dir on disk so a popular tooling package consumed
 /// by many importers gets read and parsed once, not once per consumer.
-pub(crate) type WsPkgJsonCache = BTreeMap<PathBuf, Option<serde_json::Value>>;
+/// Manifests of directories bins are read from outside the virtual store,
+/// keyed by directory: the parsed manifest, `None` when there is none, or
+/// why it couldn't be read or parsed.
+pub(crate) type WsPkgJsonCache = BTreeMap<PathBuf, Result<Option<serde_json::Value>, String>>;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ManagedBinEntry {
@@ -303,22 +306,14 @@ pub(super) fn link_bins(
     std::fs::create_dir_all(&bin_dir).into_diagnostic()?;
 
     for dep in graph.root_deps() {
-        // An explicit `link:` wins over a workspace package of the same name:
-        // `node_modules/<name>` points at the link target.
-        let link_dir = link_dep_dir(graph, &dep.dep_path, project_dir);
-        let manifest_errors = ManifestErrors::for_link(link_dir.is_some());
-        let linked_dir = link_dir.or_else(|| ws_dirs.and_then(|m| m.get(&dep.name)).cloned());
-        if let Some(dir) = linked_dir {
-            link_bins_for_workspace_dep(
-                ws_cache,
-                &bin_dir,
-                &dir,
-                &dep.name,
-                manifest_errors,
-                shim_opts,
-                managed,
-                preserved,
-            )?;
+        if let Some((dir, on_error)) =
+            unmaterialized_bin_source(graph, &dep.dep_path, &dep.name, project_dir, ws_dirs)
+        {
+            if let Some(pkg_json) = read_bin_manifest(ws_cache, &dir, &dep.name, on_error)? {
+                link_bins_from_dir(
+                    &bin_dir, &dir, &dep.name, &pkg_json, shim_opts, managed, preserved,
+                )?;
+            }
         } else {
             link_bins_for_dep(
                 cache,
@@ -339,30 +334,41 @@ pub(super) fn link_bins(
     Ok(())
 }
 
-/// The directory to read a `link:` dep's bins from. The linker never
-/// materializes `link:` deps in the virtual store — it only symlinks
-/// `<modules_dir>/<name>` at the target — so `link_bins_for_dep` finds no
-/// `package.json` for them. Read the target itself, whose path the graph
-/// keeps relative to `project_dir`: a workspace member's own symlink may
-/// be missing when `dedupe-direct-deps` leaves only the root's. `None`
-/// for every other kind of dep.
-fn link_dep_dir(
+/// Where to read a direct dep's bins from when the linker doesn't
+/// materialize it in the virtual store, and how to treat a manifest there
+/// that can't be read or parsed. `None` for a dep the virtual store holds.
+///
+/// A `link:` dep is read from its target, whose path the graph keeps
+/// relative to `project_dir`: the linker only symlinks
+/// `<modules_dir>/<name>` at it, and a workspace member's own symlink may
+/// be missing when `dedupe-direct-deps` leaves only the root's. An explicit
+/// `link:` wins over a workspace package of the same name, as
+/// `<modules_dir>/<name>` points at the link target. A workspace dep is
+/// read from the workspace package's directory.
+fn unmaterialized_bin_source(
     graph: &aube_lockfile::LockfileGraph,
     dep_path: &str,
+    name: &str,
     project_dir: &Path,
-) -> Option<PathBuf> {
-    match &graph.packages.get(dep_path)?.local_source {
-        Some(aube_lockfile::LocalSource::Link(path)) => {
-            Some(aube_util::path::normalize_lexical(&project_dir.join(path)))
-        }
-        _ => None,
+    ws_dirs: Option<&BTreeMap<String, PathBuf>>,
+) -> Option<(PathBuf, ManifestErrors)> {
+    if let Some(aube_lockfile::LocalSource::Link(path)) = graph
+        .packages
+        .get(dep_path)
+        .and_then(|pkg| pkg.local_source.as_ref())
+    {
+        let dir = aube_util::path::normalize_lexical(&project_dir.join(path));
+        return Some((dir, ManifestErrors::WarnAndSkip));
     }
+    ws_dirs?
+        .get(name)
+        .map(|dir| (dir.clone(), ManifestErrors::Fail))
 }
 
-/// How [`link_bins_for_workspace_dep`] treats a `package.json` it can't
-/// read or parse.
+/// How to treat a `package.json` that [`read_bin_manifest`] can't read or
+/// parse.
 #[derive(Clone, Copy)]
-pub(super) enum ManifestErrors {
+enum ManifestErrors {
     /// Fail the install: a workspace package's manifest is part of the
     /// workspace itself.
     Fail,
@@ -371,92 +377,63 @@ pub(super) enum ManifestErrors {
     WarnAndSkip,
 }
 
-impl ManifestErrors {
-    fn for_link(is_link: bool) -> Self {
-        if is_link {
-            Self::WarnAndSkip
-        } else {
-            Self::Fail
-        }
-    }
-}
-
-/// Link bins declared by a `workspace:` (or, via [`link_dep_dir`], a
-/// `link:`) dep into the importer's `.bin/`. Workspace deps don't get a `.aube/<dep_path>/` materialization
-/// (the linker symlinks them straight into the importer's `node_modules/`),
-/// so `link_bins_for_dep` finds nothing on disk and silently skips. Read
-/// the workspace package's own `package.json` and shim each bin entry,
-/// matching pnpm's behavior of exposing workspace bins to dependent
-/// packages' npm scripts.
+/// The `package.json` in `dir`, read once per install through `cache`,
+/// with `on_error` applied to a read or parse failure on every call, so
+/// each importer gets its own warning or error whatever order importers
+/// come in.
 ///
-/// `cache` deduplicates the read+parse across importers — without it,
-/// a popular tooling package consumed by N workspace members gets its
-/// `package.json` read N times during a single install.
-#[allow(clippy::too_many_arguments)]
-pub(super) fn link_bins_for_workspace_dep(
+/// A missing `package.json` is not an error: the dep has no bins, and,
+/// like pnpm, install says nothing about it.
+fn read_bin_manifest(
     cache: &mut WsPkgJsonCache,
-    bin_dir: &Path,
-    ws_dir: &Path,
+    dir: &Path,
     name: &str,
-    manifest_errors: ManifestErrors,
-    shim_opts: aube_linker::BinShimOptions,
-    managed: &mut ManagedBinLinks,
-    preserved: Option<&PreservedBinLinks>,
-) -> miette::Result<()> {
-    let pkg_json = if let Some(cached) = cache.get(ws_dir) {
-        cached.clone()
-    } else {
-        let pkg_json_path = ws_dir.join("package.json");
-        let skip = |problem: &dyn std::fmt::Display| {
+    on_error: ManifestErrors,
+) -> miette::Result<Option<serde_json::Value>> {
+    let loaded = cache.entry(dir.to_path_buf()).or_insert_with(|| {
+        let pkg_json_path = dir.join("package.json");
+        match std::fs::read_to_string(&pkg_json_path) {
+            Ok(content) => aube_manifest::parse_json(&pkg_json_path, content)
+                .map(Some)
+                // The parse error already names the file.
+                .map_err(|e| e.to_string()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(format!("failed to read {}: {e}", pkg_json_path.display())),
+        }
+    });
+    match (loaded, on_error) {
+        (Ok(pkg_json), _) => Ok(pkg_json.clone()),
+        (Err(problem), ManifestErrors::WarnAndSkip) => {
             tracing::warn!(
                 code = aube_codes::warnings::WARN_AUBE_LINK_DEP_MANIFEST_UNREADABLE,
                 "skipping bins of link: dep {name}: {problem}"
             );
-        };
-        let parsed = match std::fs::read_to_string(&pkg_json_path) {
-            Ok(content) => {
-                match aube_manifest::parse_json::<serde_json::Value>(&pkg_json_path, content) {
-                    Ok(value) => Some(value),
-                    Err(e) => match manifest_errors {
-                        ManifestErrors::WarnAndSkip => {
-                            // The parse error already names the file.
-                            skip(&e);
-                            None
-                        }
-                        ManifestErrors::Fail => {
-                            return Err(miette::Report::new(e).wrap_err(format!(
-                                "failed to parse package.json for workspace dep {name}"
-                            )));
-                        }
-                    },
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(e) => match manifest_errors {
-                ManifestErrors::WarnAndSkip => {
-                    skip(&format_args!(
-                        "failed to read {}: {e}",
-                        pkg_json_path.display()
-                    ));
-                    None
-                }
-                ManifestErrors::Fail => {
-                    return Err(miette!(
-                        "failed to read package.json for workspace dep {name} at {}: {e}",
-                        pkg_json_path.display()
-                    ));
-                }
-            },
-        };
-        cache.insert(ws_dir.to_path_buf(), parsed.clone());
-        parsed
-    };
-    if let Some(pkg_json) = pkg_json
-        && let Some(bin) = pkg_json.get("bin")
-    {
+            Ok(None)
+        }
+        (Err(problem), ManifestErrors::Fail) => Err(miette!(
+            "failed to load package.json for workspace dep {name}: {problem}"
+        )),
+    }
+}
+
+/// Link the bins that `pkg_json`, the manifest in `dir`, declares into
+/// `bin_dir`. Used for deps the virtual store doesn't hold (workspace and
+/// `link:` deps, see [`unmaterialized_bin_source`]), where
+/// `link_bins_for_dep` would find no `package.json` and skip them. pnpm
+/// exposes these bins to the importer's scripts the same way.
+fn link_bins_from_dir(
+    bin_dir: &Path,
+    dir: &Path,
+    name: &str,
+    pkg_json: &serde_json::Value,
+    shim_opts: aube_linker::BinShimOptions,
+    managed: &mut ManagedBinLinks,
+    preserved: Option<&PreservedBinLinks>,
+) -> miette::Result<()> {
+    if let Some(bin) = pkg_json.get("bin") {
         link_bin_entries(
             bin_dir,
-            ws_dir,
+            dir,
             Some(name),
             bin,
             shim_opts,
@@ -943,20 +920,26 @@ pub(crate) fn link_all_bins(input: LinkAllBinsInput<'_>) -> miette::Result<Manag
             let bin_dir = pkg_dir.join(modules_dir_name).join(".bin");
             std::fs::create_dir_all(&bin_dir).into_diagnostic()?;
             for dep in deps {
-                let link_dir = link_dep_dir(graph, &dep.dep_path, project_dir);
-                let manifest_errors = ManifestErrors::for_link(link_dir.is_some());
-                let linked_dir = link_dir.or_else(|| ws_dirs.get(&dep.name).cloned());
-                if let Some(dir) = linked_dir {
-                    link_bins_for_workspace_dep(
-                        &mut ws_pkg_json_cache,
-                        &bin_dir,
-                        &dir,
-                        &dep.name,
-                        manifest_errors,
-                        shim_opts,
-                        &mut managed,
-                        preserved,
-                    )?;
+                if let Some((dir, on_error)) = unmaterialized_bin_source(
+                    graph,
+                    &dep.dep_path,
+                    &dep.name,
+                    project_dir,
+                    Some(ws_dirs),
+                ) {
+                    if let Some(pkg_json) =
+                        read_bin_manifest(&mut ws_pkg_json_cache, &dir, &dep.name, on_error)?
+                    {
+                        link_bins_from_dir(
+                            &bin_dir,
+                            &dir,
+                            &dep.name,
+                            &pkg_json,
+                            shim_opts,
+                            &mut managed,
+                            preserved,
+                        )?;
+                    }
                 } else {
                     link_bins_for_dep(
                         &mut pkg_json_cache,
@@ -2696,5 +2679,24 @@ mod tests {
             !cmd.contains(r"..\..\..\..\..\"),
             ".cmd shim should not climb above the `.aube/` root; got:\n{cmd}"
         );
+    }
+
+    #[test]
+    fn read_bin_manifest_applies_each_callers_policy_to_a_cached_failure() {
+        // The cache records why a manifest failed, not just "no manifest",
+        // so a later `Fail` reader still fails after a `WarnAndSkip` one.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), "{not json").unwrap();
+        let mut cache = WsPkgJsonCache::new();
+        let skipped = read_bin_manifest(&mut cache, dir.path(), "pkg", ManifestErrors::WarnAndSkip);
+        assert!(matches!(skipped, Ok(None)));
+        let failed = read_bin_manifest(&mut cache, dir.path(), "pkg", ManifestErrors::Fail);
+        assert!(failed.is_err());
+        // A missing manifest is "no bins" under either policy.
+        let empty = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            read_bin_manifest(&mut cache, empty.path(), "pkg", ManifestErrors::Fail),
+            Ok(None)
+        ));
     }
 }
