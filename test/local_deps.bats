@@ -304,9 +304,12 @@ EOF
 }
 
 @test "aube install fails on a malformed workspace package that another importer links, whichever importer comes first" {
-	# A `link:` reader of a bad manifest only warns, but a `workspace:*`
-	# reader of the same directory must still fail the install with the
-	# manifest's error code, in either importer order.
+	# A `link:` reader of a bad manifest only warns, but install must still
+	# fail when a `workspace:*` importer reaches the same directory, in
+	# either importer order. Workspace discovery parses every member's
+	# manifest first, so this fails there and never reaches bin linking;
+	# the bin-linking cache's per-caller policy is pinned by the
+	# `read_bin_manifest` unit test.
 	for link_importer in a b; do
 		rm -rf ws
 		mkdir -p ws/packages/pkg ws/packages/a ws/packages/b
