@@ -330,9 +330,7 @@ EOF
 			echo "{\"name\":\"$importer\",\"version\":\"0.0.0\",\"dependencies\":{\"pkg\":\"$spec\"}}" >"ws/packages/$importer/package.json"
 		done
 
-		cd ws
-		run aube install
-		cd ..
+		run aube -C ws install
 		assert_failure 70
 		assert_output --partial "ERR_AUBE_MANIFEST_PARSE"
 		assert_output --partial "pkg/package.json"
