@@ -180,6 +180,22 @@ JSON
 	assert_line "linked-tool ran"
 }
 
+@test "aube install warns and skips the bins of a link: dep with a malformed package.json" {
+	# The resolver accepts a link: target whose manifest doesn't parse, so
+	# its bins alone mustn't fail the install.
+	mkdir -p broken app
+	echo '{not json' >broken/package.json
+	cd app
+	cat >package.json <<'EOF'
+{"name":"app","version":"0.0.0","dependencies":{"broken":"link:../broken"}}
+EOF
+
+	run aube install
+	assert_success
+	assert_output --partial "WARN_AUBE_LINK_DEP_MANIFEST_UNREADABLE"
+	[ -L node_modules/broken ]
+}
+
 @test "a link: dep's bins win over a same-named workspace package" {
 	mkdir -p outside/tool packages/tool
 	cat >outside/tool/package.json <<'EOF'

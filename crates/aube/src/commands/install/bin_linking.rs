@@ -305,11 +305,19 @@ pub(super) fn link_bins(
     for dep in graph.root_deps() {
         // An explicit `link:` wins over a workspace package of the same name:
         // `node_modules/<name>` points at the link target.
-        let linked_dir = link_dep_dir(graph, &dep.dep_path, project_dir)
-            .or_else(|| ws_dirs.and_then(|m| m.get(&dep.name)).cloned());
+        let link_dir = link_dep_dir(graph, &dep.dep_path, project_dir);
+        let manifest_errors = ManifestErrors::for_link(link_dir.is_some());
+        let linked_dir = link_dir.or_else(|| ws_dirs.and_then(|m| m.get(&dep.name)).cloned());
         if let Some(dir) = linked_dir {
             link_bins_for_workspace_dep(
-                ws_cache, &bin_dir, &dir, &dep.name, shim_opts, managed, preserved,
+                ws_cache,
+                &bin_dir,
+                &dir,
+                &dep.name,
+                manifest_errors,
+                shim_opts,
+                managed,
+                preserved,
             )?;
         } else {
             link_bins_for_dep(
@@ -351,6 +359,28 @@ fn link_dep_dir(
     }
 }
 
+/// How [`link_bins_for_workspace_dep`] treats a `package.json` it can't
+/// read or parse.
+#[derive(Clone, Copy)]
+pub(super) enum ManifestErrors {
+    /// Fail the install: a workspace package's manifest is part of the
+    /// workspace itself.
+    Fail,
+    /// Warn and link no bins: the resolver accepts a `link:` target
+    /// without a usable manifest, so its bins alone mustn't fail install.
+    WarnAndSkip,
+}
+
+impl ManifestErrors {
+    fn for_link(is_link: bool) -> Self {
+        if is_link {
+            Self::WarnAndSkip
+        } else {
+            Self::Fail
+        }
+    }
+}
+
 /// Link bins declared by a `workspace:` (or, via [`link_dep_dir`], a
 /// `link:`) dep into the importer's `.bin/`. Workspace deps don't get a `.aube/<dep_path>/` materialization
 /// (the linker symlinks them straight into the importer's `node_modules/`),
@@ -362,11 +392,13 @@ fn link_dep_dir(
 /// `cache` deduplicates the read+parse across importers — without it,
 /// a popular tooling package consumed by N workspace members gets its
 /// `package.json` read N times during a single install.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn link_bins_for_workspace_dep(
     cache: &mut WsPkgJsonCache,
     bin_dir: &Path,
     ws_dir: &Path,
     name: &str,
+    manifest_errors: ManifestErrors,
     shim_opts: aube_linker::BinShimOptions,
     managed: &mut ManagedBinLinks,
     preserved: Option<&PreservedBinLinks>,
@@ -375,21 +407,46 @@ pub(super) fn link_bins_for_workspace_dep(
         cached.clone()
     } else {
         let pkg_json_path = ws_dir.join("package.json");
+        let skip = |problem: &dyn std::fmt::Display| {
+            tracing::warn!(
+                code = aube_codes::warnings::WARN_AUBE_LINK_DEP_MANIFEST_UNREADABLE,
+                "skipping bins of link: dep {name}: {problem}"
+            );
+        };
         let parsed = match std::fs::read_to_string(&pkg_json_path) {
-            Ok(content) => Some(
-                aube_manifest::parse_json::<serde_json::Value>(&pkg_json_path, content)
-                    .map_err(miette::Report::new)
-                    .wrap_err_with(|| {
-                        format!("failed to parse package.json for linked dep {name}")
-                    })?,
-            ),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(e) => {
-                return Err(miette!(
-                    "failed to read package.json for linked dep {name} at {}: {e}",
-                    pkg_json_path.display()
-                ));
+            Ok(content) => {
+                match aube_manifest::parse_json::<serde_json::Value>(&pkg_json_path, content) {
+                    Ok(value) => Some(value),
+                    Err(e) => match manifest_errors {
+                        ManifestErrors::WarnAndSkip => {
+                            // The parse error already names the file.
+                            skip(&e);
+                            None
+                        }
+                        ManifestErrors::Fail => {
+                            return Err(miette::Report::new(e).wrap_err(format!(
+                                "failed to parse package.json for workspace dep {name}"
+                            )));
+                        }
+                    },
+                }
             }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => match manifest_errors {
+                ManifestErrors::WarnAndSkip => {
+                    skip(&format_args!(
+                        "failed to read {}: {e}",
+                        pkg_json_path.display()
+                    ));
+                    None
+                }
+                ManifestErrors::Fail => {
+                    return Err(miette!(
+                        "failed to read package.json for workspace dep {name} at {}: {e}",
+                        pkg_json_path.display()
+                    ));
+                }
+            },
         };
         cache.insert(ws_dir.to_path_buf(), parsed.clone());
         parsed
@@ -886,14 +943,16 @@ pub(crate) fn link_all_bins(input: LinkAllBinsInput<'_>) -> miette::Result<Manag
             let bin_dir = pkg_dir.join(modules_dir_name).join(".bin");
             std::fs::create_dir_all(&bin_dir).into_diagnostic()?;
             for dep in deps {
-                let linked_dir = link_dep_dir(graph, &dep.dep_path, project_dir)
-                    .or_else(|| ws_dirs.get(&dep.name).cloned());
+                let link_dir = link_dep_dir(graph, &dep.dep_path, project_dir);
+                let manifest_errors = ManifestErrors::for_link(link_dir.is_some());
+                let linked_dir = link_dir.or_else(|| ws_dirs.get(&dep.name).cloned());
                 if let Some(dir) = linked_dir {
                     link_bins_for_workspace_dep(
                         &mut ws_pkg_json_cache,
                         &bin_dir,
                         &dir,
                         &dep.name,
+                        manifest_errors,
                         shim_opts,
                         &mut managed,
                         preserved,
