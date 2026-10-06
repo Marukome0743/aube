@@ -696,8 +696,12 @@ impl Linker {
                 // importer key (`../sibling`, possible when
                 // `pnpm-workspace.yaml#packages` uses `../**`) needs
                 // to land at the actual sibling dir before
-                // `pathdiff`/`strip_prefix` see it.
-                aube_util::path::normalize_lexical(&root_dir.join(importer_path))
+                // `pathdiff`/`strip_prefix` see it. A member a symlink
+                // relocates is planned where it really is, so Node can
+                // reach what lands in its `node_modules`.
+                crate::relocated_importer_dir(root_dir, importer_path).unwrap_or_else(|| {
+                    aube_util::path::normalize_lexical(&root_dir.join(importer_path))
+                })
             };
             // Workspace deps resolve through `workspace_dirs` rather
             // than going through the placement tree, so the hoisted
@@ -762,7 +766,9 @@ impl Linker {
             let importer_dir = if importer_path == "." {
                 root_dir.to_path_buf()
             } else {
-                aube_util::path::normalize_lexical(&root_dir.join(importer_path))
+                crate::relocated_importer_dir(root_dir, importer_path).unwrap_or_else(|| {
+                    aube_util::path::normalize_lexical(&root_dir.join(importer_path))
+                })
             };
             let nm = self.checked_modules_dir(&importer_dir)?;
             if !self.hoist_workspace_packages {

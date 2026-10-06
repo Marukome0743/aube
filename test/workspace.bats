@@ -509,6 +509,50 @@ _setup_shared_direct_dep_workspace() {
 	done
 }
 
+@test "aube install --node-linker=hoisted links members outside the root and behind a symlink" {
+	# Node can't walk from either member up into ws/node_modules, so each
+	# gets its own copy of what it needs, linked from where it really is.
+	mkdir -p ws/packages/sib ws/vendor/lib sibling outside/app
+	cd ws
+	cat >package.json <<-'EOF'
+		{"name": "root", "version": "0.0.0", "private": true, "dependencies": {"is-odd": "3.0.1"}}
+	EOF
+	cat >pnpm-workspace.yaml <<-'EOF'
+		packages:
+		  - packages/*
+		  - ../sibling
+	EOF
+	echo 'node-linker=hoisted' >.npmrc
+	echo '{"name": "lib", "version": "2.0.0"}' >vendor/lib/package.json
+	echo '{"name": "sib", "version": "1.0.0", "bin": {"sib": "cli.js"}}' >packages/sib/package.json
+	printf '#!/usr/bin/env node\nconsole.log("sib ran")\n' >packages/sib/cli.js
+	cat >../sibling/package.json <<-'EOF'
+		{"name": "sibling", "version": "1.0.0", "dependencies": {"lib": "link:../ws/vendor/lib", "is-odd": "3.0.1", "sib": "workspace:*"}}
+	EOF
+	cat >../outside/app/package.json <<-'EOF'
+		{"name": "app", "version": "1.0.0", "dependencies": {"lib": "link:../../vendor/lib", "is-odd": "3.0.1", "sib": "workspace:*"}}
+	EOF
+	ln -s ../../outside/app packages/app
+
+	run aube install
+	assert_success
+	local ws=$PWD
+	for member in ../sibling ../outside/app; do
+		cd "$ws/$member"
+		run node -e "for (const d of ['lib', 'is-odd', 'sib']) console.log(require(d + '/package.json').version)"
+		assert_success
+		assert_output "2.0.0
+3.0.1
+1.0.0"
+		run ./node_modules/.bin/sib
+		assert_output "sib ran"
+	done
+	cd "$ws"
+	run aube install
+	assert_success
+	assert_output --partial "Already up to date"
+}
+
 @test "aube install: dedupeDirectDeps=true keeps the link of a member outside the root" {
 	# Node never walks from `../sibling` into the root's node_modules.
 	mkdir -p root sibling
