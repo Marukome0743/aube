@@ -468,6 +468,47 @@ _setup_shared_direct_dep_workspace() {
 	assert_output "3.0.1"
 }
 
+@test "aube install links the deps of a member that is a symlink to outside the root" {
+	# Node resolves from where the member really is, so its links have to
+	# be relative to that, and it can't reach the root's node_modules.
+	mkdir -p ws/packages/sib ws/vendor/lib outside/app
+	cd ws
+	cat >package.json <<-'EOF'
+		{"name": "root", "version": "0.0.0", "private": true, "dependencies": {"is-odd": "3.0.1"}}
+	EOF
+	cat >pnpm-workspace.yaml <<-'EOF'
+		packages:
+		  - packages/*
+	EOF
+	echo '{"name": "lib", "version": "2.0.0"}' >vendor/lib/package.json
+	echo '{"name": "sib", "version": "1.0.0", "bin": {"sib": "cli.js"}}' >packages/sib/package.json
+	printf '#!/usr/bin/env node\nconsole.log("sib ran")\n' >packages/sib/cli.js
+	cat >../outside/app/package.json <<-'EOF'
+		{"name": "app", "version": "1.0.0", "dependencies": {"lib": "link:../../vendor/lib", "is-odd": "3.0.1", "sib": "workspace:*"}}
+	EOF
+	ln -s ../../outside/app packages/app
+
+	for npmrc in "" "dedupe-direct-deps=true"; do
+		rm -rf node_modules packages/sib/node_modules ../outside/app/node_modules aube-lock.yaml
+		echo "$npmrc" >.npmrc
+		run aube install
+		assert_success
+		cd ../outside/app
+		run node -e "for (const d of ['lib', 'is-odd', 'sib']) console.log(require(d + '/package.json').version)"
+		assert_success
+		assert_output "2.0.0
+3.0.1
+1.0.0"
+		run ./node_modules/.bin/sib
+		assert_output "sib ran"
+		cd ../../ws
+		run aube install
+		assert_success
+		assert_output --partial "Already up to date"
+		refute_output --partial "Already up to date ("
+	done
+}
+
 @test "aube install: dedupeDirectDeps=true keeps the link of a member outside the root" {
 	# Node never walks from `../sibling` into the root's node_modules.
 	mkdir -p root sibling

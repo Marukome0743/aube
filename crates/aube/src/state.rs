@@ -1333,11 +1333,14 @@ impl InstallLayoutState {
             } else {
                 aube_util::path::normalize_lexical(&project_dir.join(importer))
             };
+            // The linker keeps every link of a member a symlink relocates.
+            let dedupes_importer = dedupes_direct_deps
+                && aube_linker::relocated_importer_dir(project_dir, importer).is_none();
             let entries = deps
                 .iter()
                 .map(|dep| {
                     // Deduped by the linker: Node finds the root's link.
-                    if dedupes_direct_deps
+                    if dedupes_importer
                         && aube_linker::dedupe_skips_member_link(
                             &layout.graph.importers,
                             importer,

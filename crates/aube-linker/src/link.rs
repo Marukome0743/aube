@@ -1256,6 +1256,9 @@ impl Linker {
         struct Step2Task<'a> {
             importer_path: &'a str,
             nm: PathBuf,
+            /// `nm` where the importer really is, when a symlink puts it
+            /// somewhere other than its workspace path.
+            real_nm: Option<PathBuf>,
             dep: &'a aube_lockfile::DirectDep,
         }
         let tasks: Vec<Step2Task<'_>> = graph
@@ -1274,9 +1277,12 @@ impl Linker {
                         &root_dir.join(importer_path).join(&self.modules_dir_name),
                     )
                 };
+                let real_nm = crate::relocated_importer_dir(&root_dir, importer_path)
+                    .map(|dir| dir.join(&self.modules_dir_name));
                 deps.iter().map(move |dep| Step2Task {
                     importer_path: importer_path.as_str(),
                     nm: nm.clone(),
+                    real_nm: real_nm.clone(),
                     dep,
                 })
             })
@@ -1291,15 +1297,29 @@ impl Linker {
                     let Step2Task {
                         importer_path,
                         nm,
+                        real_nm,
                         dep,
                     } = task;
+                    // Node resolves from where the importer really is, so
+                    // each link is relative to its real parent directory.
+                    let real_parent = |link_path: &Path| -> PathBuf {
+                        match real_nm {
+                            Some(real_nm) => {
+                                let real_link = real_nm.join(&dep.name);
+                                real_link.parent().unwrap_or(real_nm).to_path_buf()
+                            }
+                            None => link_path.parent().unwrap_or(nm).to_path_buf(),
+                        }
+                    };
 
                     // `dedupeDirectDeps`: non-root importer dep
                     // already covered by the root symlink +
                     // parent-directory walk. A link the member kept
                     // from an earlier, different version would shadow
-                    // the root's, so clear it.
+                    // the root's, so clear it. A member a symlink puts
+                    // elsewhere may never reach the root's link.
                     if self.dedupe_direct_deps
+                        && real_nm.is_none()
                         && crate::dedupe_skips_member_link(&graph.importers, importer_path, dep)
                     {
                         crate::validate_package_link_name(&dep.name)?;
@@ -1349,9 +1369,9 @@ impl Linker {
                         if !self.hoist_workspace_packages {
                             return Ok(false);
                         }
-                        let link_parent = link_path.parent().unwrap_or(nm);
+                        let link_parent = real_parent(&link_path);
                         let rel_target =
-                            pathdiff::diff_paths(ws_dir, link_parent).unwrap_or(ws_dir.clone());
+                            pathdiff::diff_paths(ws_dir, &link_parent).unwrap_or(ws_dir.clone());
                         if reconcile_dir_link(&link_path, &rel_target)? {
                             return Ok(false);
                         }
@@ -1367,9 +1387,9 @@ impl Linker {
                         && let Some(LocalSource::Link(rel)) = locked.local_source.as_ref()
                     {
                         let abs_target = root_dir.join(rel);
-                        let link_parent = link_path.parent().unwrap_or(nm);
+                        let link_parent = real_parent(&link_path);
                         let rel_target =
-                            pathdiff::diff_paths(&abs_target, link_parent).unwrap_or(abs_target);
+                            pathdiff::diff_paths(&abs_target, &link_parent).unwrap_or(abs_target);
                         if reconcile_dir_link(&link_path, &rel_target)? {
                             return Ok(false);
                         }
@@ -1389,8 +1409,8 @@ impl Linker {
                     if !source_dir.exists() {
                         return Ok(false);
                     }
-                    let link_parent = link_path.parent().unwrap_or(nm);
-                    let rel_target = pathdiff::diff_paths(&source_dir, link_parent)
+                    let link_parent = real_parent(&link_path);
+                    let rel_target = pathdiff::diff_paths(&source_dir, &link_parent)
                         .unwrap_or_else(|| source_dir.clone());
                     if reconcile_dir_link(&link_path, &rel_target)? {
                         return Ok(false);

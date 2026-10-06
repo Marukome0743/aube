@@ -941,7 +941,10 @@ pub(crate) fn link_all_bins(input: LinkAllBinsInput<'_>) -> miette::Result<Manag
             if importer_path == "." || !aube_linker::is_physical_importer(importer_path) {
                 continue;
             }
-            let pkg_dir = project_dir.join(importer_path);
+            // Shims hold paths relative to their `.bin`, so a member a
+            // symlink relocates gets them written where it really is.
+            let pkg_dir = aube_linker::relocated_importer_dir(project_dir, importer_path)
+                .unwrap_or_else(|| project_dir.join(importer_path));
             let bin_dir = pkg_dir.join(modules_dir_name).join(".bin");
             std::fs::create_dir_all(&bin_dir).into_diagnostic()?;
             for dep in deps {
@@ -1046,9 +1049,10 @@ pub(crate) fn remove_unclaimed_bin_links(
             workspace_dirs.push(aube_util::path::normalize_lexical(
                 &project_dir.join(importer_path),
             ));
+            // Where `link_all_bins` wrote the member's shims.
             bin_dirs.insert(
-                project_dir
-                    .join(importer_path)
+                aube_linker::relocated_importer_dir(project_dir, importer_path)
+                    .unwrap_or_else(|| project_dir.join(importer_path))
                     .join(modules_dir_name)
                     .join(".bin"),
             );
