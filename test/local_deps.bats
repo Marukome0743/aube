@@ -303,6 +303,65 @@ EOF
 	[ ! -e node_modules/.bin/linked-tool ]
 }
 
+@test "aube install follows a link: target's changed bin past the warm path" {
+	# With a registry dep in the graph the warm path applies, and it used
+	# to skip a link: target's manifest entirely.
+	mkdir -p linked-tool app
+	cat >linked-tool/package.json <<'EOF'
+{"name":"linked-tool","version":"1.0.0","bin":{"linked-tool":"cli.js"}}
+EOF
+	printf '#!/usr/bin/env node\nconsole.log("linked-tool ran");\n' >linked-tool/cli.js
+	cd app
+	cat >package.json <<'EOF'
+{"name":"app","version":"0.0.0","dependencies":{"linked-tool":"link:../linked-tool","is-odd":"3.0.1"}}
+EOF
+	run aube install
+	assert_success
+
+	# An edit that doesn't change what install links keeps the warm path.
+	cat >../linked-tool/package.json <<'EOF'
+{"name":"linked-tool","version":"1.0.0","description":"cosmetic","bin":{"linked-tool":"cli.js"}}
+EOF
+	run aube install
+	assert_success
+	assert_output --partial "Already up to date"
+	refute_output --partial "Already up to date ("
+
+	cat >../linked-tool/package.json <<'EOF'
+{"name":"linked-tool","version":"1.0.0","bin":{"renamed-tool":"cli.js"}}
+EOF
+	run aube install
+	assert_success
+	[ -e node_modules/.bin/renamed-tool ]
+	[ ! -e node_modules/.bin/linked-tool ]
+}
+
+@test "aube install follows a workspace package's changed bin past the warm path" {
+	mkdir -p packages/tool packages/app
+	cat >pnpm-workspace.yaml <<'EOF'
+packages:
+  - packages/*
+EOF
+	echo '{"name":"root","private":true}' >package.json
+	cat >packages/tool/package.json <<'EOF'
+{"name":"tool","version":"1.0.0","bin":{"tool":"cli.js"}}
+EOF
+	printf '#!/usr/bin/env node\nconsole.log("tool ran");\n' >packages/tool/cli.js
+	cat >packages/app/package.json <<'EOF'
+{"name":"app","version":"1.0.0","dependencies":{"tool":"workspace:*","is-odd":"3.0.1"}}
+EOF
+	run aube install
+	assert_success
+
+	cat >packages/tool/package.json <<'EOF'
+{"name":"tool","version":"1.0.0","bin":{"renamed-tool":"cli.js"}}
+EOF
+	run aube install
+	assert_success
+	[ -e packages/app/node_modules/.bin/renamed-tool ]
+	[ ! -e packages/app/node_modules/.bin/tool ]
+}
+
 @test "aube install fails on a malformed workspace package that another importer links, whichever importer comes first" {
 	# A `link:` reader of a bad manifest only warns, but install must still
 	# fail when a `workspace:*` importer reaches the same directory, in
